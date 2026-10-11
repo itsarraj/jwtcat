@@ -5,6 +5,12 @@ again. Debugging auth almost always means looking at a *real* token from
 a *real* session, and jwt.io is a website you're sending that token to.
 This is a static binary that does the same decode/verify locally.
 
+## Installation
+
+```sh
+cargo install --path .
+```
+
 ## Usage
 
 ```bash
