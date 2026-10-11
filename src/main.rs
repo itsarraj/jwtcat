@@ -5,7 +5,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use jwtcat::expiry::{check_time_validity, TimeStatus};
 use jwtcat::parse::decode;
-use jwtcat::verify::{sign_hmac_hs256, verify_hmac, VerifyResult};
+use jwtcat::verify::{sign_hmac_hs256, verify_signature, VerifyResult};
 
 #[derive(Parser)]
 #[command(
@@ -72,7 +72,10 @@ fn main() -> anyhow::Result<()> {
             // correctly-signed-but-expired token as fully valid, which is
             // exactly the mistake a "verify" command exists to prevent.
             let time_status = check_time_validity(&decoded.payload, SystemTime::now());
-            match verify_hmac(&decoded, secret.as_bytes()) {
+            
+            let secret_bytes = std::fs::read(&secret).unwrap_or_else(|_| secret.as_bytes().to_vec());
+            
+            match verify_signature(&decoded, &secret_bytes) {
                 VerifyResult::Valid => {
                     println!("signature: VALID");
                     match time_status {
@@ -87,7 +90,7 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 VerifyResult::UnsupportedAlg(alg) => {
-                    println!("signature: NOT CHECKED — '{alg}' isn't HMAC (jwtcat only verifies HS256/HS384/HS512; RS/ES/PS algorithms need the issuer's public key, not implemented in this v1)");
+                    println!("signature: NOT CHECKED — '{alg}' is not supported by jwtcat");
                     std::process::exit(2);
                 }
             }

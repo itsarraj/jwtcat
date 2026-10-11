@@ -16,14 +16,7 @@ pub enum VerifyResult {
     UnsupportedAlg(String),
 }
 
-/// Verifies an HMAC-family (`HS256`/`HS384`/`HS512`) signature against
-/// `secret`. Recomputes the HMAC over `decoded.signing_input` exactly as
-/// received (see `DecodedJwt`'s doc comment) and compares it to the
-/// token's actual signature bytes using each `hmac` crate's own
-/// constant-time `verify_slice` — never a manual `==` on the digests,
-/// which would reintroduce exactly the timing side-channel HMAC
-/// verification exists to avoid.
-pub fn verify_hmac(decoded: &DecodedJwt, secret: &[u8]) -> VerifyResult {
+pub fn verify_signature(decoded: &DecodedJwt, key: &[u8]) -> VerifyResult {
     let alg = decoded
         .header
         .get("alg")
@@ -32,16 +25,17 @@ pub fn verify_hmac(decoded: &DecodedJwt, secret: &[u8]) -> VerifyResult {
     let input = decoded.signing_input.as_bytes();
 
     match alg {
-        "HS256" => verify_with::<Hmac<Sha256>>(input, secret, &decoded.signature),
-        "HS384" => verify_with::<Hmac<Sha384>>(input, secret, &decoded.signature),
-        "HS512" => verify_with::<Hmac<Sha512>>(input, secret, &decoded.signature),
-        // The classic JWT forgery: an attacker sets `alg: none` and strips
-        // the signature entirely, betting that a lax verifier treats an
-        // absent check as a passing one. Flagged with its own message
-        // (still `UnsupportedAlg`, still never `Valid` — just a clearer
-        // reason why) rather than folded into the generic RS256-style
-        // "not implemented yet" case, since this one is an attack, not a
-        // missing feature.
+        "HS256" => verify_with_hmac::<Hmac<Sha256>>(input, key, &decoded.signature),
+        "HS384" => verify_with_hmac::<Hmac<Sha384>>(input, key, &decoded.signature),
+        "HS512" => verify_with_hmac::<Hmac<Sha512>>(input, key, &decoded.signature),
+        "RS256" => verify_with_ring(&ring::signature::RSA_PKCS1_2048_8192_SHA256, input, key, &decoded.signature),
+        "RS384" => verify_with_ring(&ring::signature::RSA_PKCS1_2048_8192_SHA384, input, key, &decoded.signature),
+        "RS512" => verify_with_ring(&ring::signature::RSA_PKCS1_2048_8192_SHA512, input, key, &decoded.signature),
+        "PS256" => verify_with_ring(&ring::signature::RSA_PSS_2048_8192_SHA256, input, key, &decoded.signature),
+        "PS384" => verify_with_ring(&ring::signature::RSA_PSS_2048_8192_SHA384, input, key, &decoded.signature),
+        "PS512" => verify_with_ring(&ring::signature::RSA_PSS_2048_8192_SHA512, input, key, &decoded.signature),
+        "ES256" => verify_with_ring(&ring::signature::ECDSA_P256_SHA256_FIXED, input, key, &decoded.signature),
+        "ES384" => verify_with_ring(&ring::signature::ECDSA_P384_SHA384_FIXED, input, key, &decoded.signature),
         "none" | "None" | "NONE" => {
             VerifyResult::UnsupportedAlg("none — this is the alg:none forgery attack, not a real algorithm; never treat this as verified".to_string())
         }
@@ -49,7 +43,7 @@ pub fn verify_hmac(decoded: &DecodedJwt, secret: &[u8]) -> VerifyResult {
     }
 }
 
-fn verify_with<M: Mac + hmac::digest::KeyInit>(
+fn verify_with_hmac<M: Mac + hmac::digest::KeyInit>(
     input: &[u8],
     secret: &[u8],
     signature: &[u8],
@@ -64,10 +58,35 @@ fn verify_with<M: Mac + hmac::digest::KeyInit>(
     }
 }
 
-/// The base64url-encoded signature a correct HMAC verification would
-/// accept — exposed for tests and for `main.rs`'s `--sign` convenience
-/// mode (recreating a token with a known secret, useful for testing your
-/// own backend's verification code against a known-good token).
+fn decode_pem(key: &[u8]) -> Vec<u8> {
+    if let Ok(key_str) = std::str::from_utf8(key) {
+        if key_str.contains("-----BEGIN PUBLIC KEY-----") || key_str.contains("-----BEGIN CERTIFICATE-----") {
+            let b64 = key_str
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>();
+            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                return der;
+            }
+        }
+    }
+    key.to_vec()
+}
+
+fn verify_with_ring(
+    alg: &'static dyn ring::signature::VerificationAlgorithm,
+    input: &[u8],
+    key: &[u8],
+    signature: &[u8],
+) -> VerifyResult {
+    let der = decode_pem(key);
+    let pub_key = ring::signature::UnparsedPublicKey::new(alg, der);
+    match pub_key.verify(input, signature) {
+        Ok(()) => VerifyResult::Valid,
+        Err(_) => VerifyResult::Invalid,
+    }
+}
+
 pub fn sign_hmac_hs256(signing_input: &str, secret: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(signing_input.as_bytes());
@@ -84,48 +103,43 @@ mod tests {
     #[test]
     fn correct_secret_verifies_the_canonical_jwt_io_example() {
         let decoded = decode(SAMPLE).unwrap();
-        let result = verify_hmac(&decoded, b"your-256-bit-secret");
+        let result = verify_signature(&decoded, b"your-256-bit-secret");
         assert_eq!(result, VerifyResult::Valid);
     }
 
     #[test]
     fn wrong_secret_is_rejected() {
         let decoded = decode(SAMPLE).unwrap();
-        let result = verify_hmac(&decoded, b"the-wrong-secret");
+        let result = verify_signature(&decoded, b"the-wrong-secret");
         assert_eq!(result, VerifyResult::Invalid);
     }
 
     #[test]
     fn tampered_payload_is_rejected_even_with_the_right_secret() {
-        // Same header/signature, but a payload edited after signing —
-        // exactly what a forged token looks like.
         let tampered = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoYWNrZWQiLCJuYW1lIjoiTWFsbG9yeSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let decoded = decode(tampered).unwrap();
-        let result = verify_hmac(&decoded, b"your-256-bit-secret");
+        let result = verify_signature(&decoded, b"your-256-bit-secret");
         assert_eq!(result, VerifyResult::Invalid);
     }
 
     #[test]
     fn unsupported_algorithm_is_reported_distinctly_not_as_invalid() {
-        // A real RS256 header, this tool doesn't attempt RSA verification.
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+            .encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"x"}"#);
         let token = format!("{header}.{payload}.fakesig");
         let decoded = decode(&token).unwrap();
-        let result = verify_hmac(&decoded, b"anything");
-        assert_eq!(result, VerifyResult::UnsupportedAlg("RS256".to_string()));
+        let result = verify_signature(&decoded, b"anything");
+        assert_eq!(result, VerifyResult::UnsupportedAlg("EdDSA".to_string()));
     }
 
     #[test]
     fn alg_none_forgery_is_never_treated_as_valid() {
-        // The classic attack: a forged token with alg:none and an empty
-        // signature — must never come back Valid, regardless of secret.
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"admin"}"#);
         let token = format!("{header}.{payload}.");
         let decoded = decode(&token).unwrap();
-        let result = verify_hmac(&decoded, b"whatever-secret-doesnt-matter");
+        let result = verify_signature(&decoded, b"whatever-secret-doesnt-matter");
         assert!(matches!(result, VerifyResult::UnsupportedAlg(_)));
         assert_ne!(result, VerifyResult::Valid);
     }
@@ -141,9 +155,9 @@ mod tests {
 
         let decoded = decode(&token).unwrap();
         assert_eq!(
-            verify_hmac(&decoded, b"my-test-secret"),
+            verify_signature(&decoded, b"my-test-secret"),
             VerifyResult::Valid
         );
-        assert_eq!(verify_hmac(&decoded, b"wrong"), VerifyResult::Invalid);
+        assert_eq!(verify_signature(&decoded, b"wrong"), VerifyResult::Invalid);
     }
 }
